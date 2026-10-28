@@ -4,26 +4,22 @@
 
 import AppKit
 import SwiftUI
-import UserNotifications
 
 let testingPanels = CommandLine.arguments.contains("--test-panels")
 
-final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSPopoverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let model = Model()
     let memoryItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let sessionsItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let memoryPopover = NSPopover()
     let sessionsPopover = NSPopover()
+    let toasts = ToastCenter()
     var timer: Timer?
     var pulseTimer: Timer?
     var pulse = false
     var closedAt = Date.distantPast      // last time a panel closed
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = self
-        center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in self?.checkNotificationSettings() }
-
         prepare(memoryPopover, NSHostingController(rootView: MemoryPanel(model: model)))
         prepare(sessionsPopover, NSHostingController(rootView: SessionsPanel(model: model) { [weak self] in
             self?.sessionsPopover.performClose(nil)
@@ -36,6 +32,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         sessionsItem.button?.imagePosition = .imageOnly
 
         model.onChange = { [weak self] in self?.drawIcons() }
+        model.onToast = { [weak self] t in
+            guard let self else { return }
+            self.toasts.sound = self.model.alertSound
+            self.toasts.show(t)
+        }
+        model.onDisplayChange = { [weak self] in self?.applyDisplay() }
+        applyDisplay()
+        model.showMemoryPanel = { [weak self] in
+            guard let self else { return }
+            self.show(self.memoryPopover, from: self.memoryItem, other: self.sessionsPopover)
+        }
         model.tick()
         // Start clean: a previous instance may have left sessions in low priority.
         model.resetAllPriorities()
@@ -45,8 +52,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if testingPanels {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.toggleSessions() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.toggleMemory() }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { NSApp.terminate(nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                self.toasts.show(Toast(key: "test", title: "Mac Breather", body: "This is what a notification looks like.",
+                                       icon: toolIcon("Claude"), state: .done, action: "Open Claude", open: {}))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { NSApp.terminate(nil) }
         }
+    }
+
+    /// Shows the memory ring, the session dots, or both. Without Claude or Codex installed, the dots stay hidden,
+    /// and at least one icon always remains so the settings stay reachable.
+    func applyDisplay() {
+        let ai = model.showsAI && aiInstalled
+        sessionsItem.isVisible = ai
+        memoryItem.isVisible = model.showsMemory || !ai
+        if !sessionsItem.isVisible { sessionsPopover.performClose(nil) }
+        if !memoryItem.isVisible { memoryPopover.performClose(nil) }
+    }
+
+    /// Opening the app again (Finder, Spotlight) shows the memory panel: a way back if macOS hid the icons.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        show(memoryPopover, from: memoryItem, other: sessionsPopover)
+        return false
     }
 
     func applicationWillTerminate(_ n: Notification) {
@@ -75,7 +102,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         other.performClose(nil)
         guard !p.isShown, let b = item.button else { return }
         model.tick(alerts: false)
-        checkNotificationSettings()
         NSApp.activate()      // without this, Escape, Tab and VoiceOver don't get into the panel
         p.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         p.contentViewController?.view.window?.makeKey()
@@ -92,12 +118,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         closedAt = Date()
         memoryItem.button?.highlight(memoryPopover.isShown)
         sessionsItem.button?.highlight(sessionsPopover.isShown)
-    }
-
-    func checkNotificationSettings() {
-        UNUserNotificationCenter.current().getNotificationSettings { s in
-            DispatchQueue.main.async { self.model.notificationsDenied = s.authorizationStatus == .denied }
-        }
     }
 
     // MARK: Menu bar icons
@@ -134,27 +154,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             pulseTimer = nil
             pulse = false
         }
-    }
-
-    // MARK: Notifications
-
-    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
-                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        done([.banner, .sound])
-    }
-
-    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
-                                withCompletionHandler done: @escaping () -> Void) {
-        let id = r.notification.request.identifier
-        DispatchQueue.main.async {
-            // Open the right panel, never closing one that is already open.
-            if id.hasPrefix("done-") || id.hasPrefix("waiting-") {
-                self.show(self.sessionsPopover, from: self.sessionsItem, other: self.memoryPopover)
-            } else {
-                self.show(self.memoryPopover, from: self.memoryItem, other: self.sessionsPopover)
-            }
-        }
-        done()
     }
 }
 
@@ -201,6 +200,7 @@ func dotsIcon(_ states: [SessionState], pulse: Bool) -> NSImage {
             case .waiting: NSColor.systemOrange.setFill(); p.fill()
             case .working: NSColor.systemBlue.withAlphaComponent(pulse ? 0.45 : 1).setFill(); p.fill()
             case .done: NSColor.systemGreen.setFill(); p.fill()
+            case .seen: NSColor.labelColor.withAlphaComponent(0.45).setFill(); p.fill()
             case .idle: p.lineWidth = 1.3; NSColor.labelColor.withAlphaComponent(0.6).setStroke(); p.stroke()
             }
         }
@@ -222,11 +222,32 @@ enum Launcher {
         let args = CommandLine.arguments
         if args.contains("--dump") { dump(); return }
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count { render(to: args[i + 1]); return }
+        if args.contains("--demo-toasts") { demoToasts(); return }
 
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
+        app.run()
+    }
+
+    /// `MacBreather --demo-toasts`: shows sample toasts on screen, then quits.
+    static func demoToasts() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let center = ToastCenter()
+        let demos = [
+            Toast(key: "a", title: "Fix the login bug", body: "Claude is done, your turn.", icon: toolIcon("Claude"), state: .done,
+                  action: "Open Claude", open: {}),
+            Toast(key: "b", title: "Rename the brand", body: "Codex needs you: needs your permission.", icon: toolIcon("Codex"), state: .waiting,
+                  action: "Open ChatGPT", open: {}),
+            Toast(key: "c", title: "Mac overloaded", body: "8% memory free, swap 9.1 GB. Simulator running without Xcode · 3.1 GB.",
+                  icon: ringIcon(fraction: 0.92, color: .systemRed), state: nil, action: "Show Memory", open: {}),
+        ]
+        for (i, t) in demos.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5 + Double(i) * 1.5) { center.show(t) }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { app.terminate(nil) }
         app.run()
     }
 
@@ -248,6 +269,7 @@ enum Launcher {
         _ = NSApplication.shared
         renderMode = true
         let m = Model()
+        m.history = (0..<360).map { 0.7 + 0.15 * sin(Double($0) / 30) }   // sample curve, to see the sparkline
         m.tick(alerts: false)
         RunLoop.main.run(until: Date().addingTimeInterval(4))
         m.tick(alerts: false)
@@ -257,6 +279,9 @@ enum Launcher {
                 let views: [(String, AnyView)] = [
                     ("memory", AnyView(MemoryPanel(model: m))),
                     ("sessions", AnyView(SessionsPanel(model: m) {})),
+                    ("toast", AnyView(ToastView(t: Toast(key: "demo", title: "Fix the login bug", body: "Claude is done, your turn.",
+                                                         icon: toolIcon("Claude"), state: .done, action: "Open Claude", open: {}),
+                                                open: {}, dismiss: {}))),
                 ]
                 for (panel, view) in views {
                     let r = ImageRenderer(content: view.background(bg).environment(\.colorScheme, scheme))

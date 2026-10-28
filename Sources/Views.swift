@@ -15,6 +15,7 @@ extension SessionState {
         case .waiting: return .orange
         case .working: return .blue
         case .done: return .green
+        case .seen: return Color(nsColor: .secondaryLabelColor)
         case .idle: return Color(nsColor: .tertiaryLabelColor)
         }
     }
@@ -27,7 +28,7 @@ func icon(for g: AppGroup) -> NSImage {
 }
 
 func toolIcon(_ tool: String) -> NSImage {
-    NSWorkspace.shared.icon(forFile: tool == "Claude" ? "/Applications/Claude.app" : "/Applications/ChatGPT.app")
+    NSWorkspace.shared.icon(forFile: tool == "Claude" ? claudeApp : codexApp)
 }
 
 /// Card background: a fill tint, not glass (glass stays on the popover).
@@ -195,8 +196,14 @@ struct MemoryPanel: View {
                 }
                 .font(.callout)
             }
+            if model.history.count > 2 {
+                VStack(alignment: .leading, spacing: 3) {
+                    Sparkline(values: model.history, color: m.health.color)
+                    Text("Last \(max(model.history.count * 5 / 60, 1)) min · dashed line at 90%").font(.caption).foregroundStyle(.secondary)
+                }
+            }
 
-            BoundedScroll(cap: screenHeight() - 300) {
+            BoundedScroll(cap: screenHeight() - 360) {
                 VStack(alignment: .leading, spacing: 14) {
                     if !model.tips.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
@@ -225,22 +232,85 @@ struct MemoryPanel: View {
             }
 
             Divider()
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle("Run idle sessions at low priority", isOn: Binding(get: { model.autoPriority }, set: { model.autoPriority = $0 }))
-                Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
-            }
-            .toggleStyle(.switch).controlSize(.mini).font(.callout)
-            HStack {
-                Button("Activity Monitor") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
-                }
-                Spacer()
-                Button("Quit Mac Breather") { NSApp.terminate(nil) }
-            }
-            .buttonStyle(.borderless).font(.callout).foregroundStyle(.secondary)
+            SettingsFooter(model: model)
         }
         .padding(16)
         .frame(width: 360)
+    }
+}
+
+/// Memory used over the last 30 minutes, with a dashed line at 90%.
+struct Sparkline: View {
+    let values: [Double]
+    let color: Color
+
+    var body: some View {
+        GeometryReader { g in
+            let step = g.size.width / CGFloat(max(values.count - 1, 1))
+            let floor = min(0.5, values.min() ?? 0)        // zoom on the top half, where it matters
+            let y = { (v: Double) in g.size.height * (1 - CGFloat(min(max((v - floor) / (1 - floor), 0), 1))) }
+            Path { p in
+                for (i, v) in values.enumerated() {
+                    let pt = CGPoint(x: CGFloat(i) * step, y: y(v))
+                    if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+                }
+            }
+            .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
+            Path { p in
+                p.move(to: CGPoint(x: 0, y: y(0.9)))
+                p.addLine(to: CGPoint(x: g.size.width, y: y(0.9)))
+            }
+            .stroke(.secondary.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        }
+        .frame(height: 34)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Memory over the last minutes: from \(Int((values.min() ?? 0) * 100)) to \(Int((values.max() ?? 0) * 100)) percent, now \(Int((values.last ?? 0) * 100)) percent")
+    }
+}
+
+/// Shared bottom of both panels: pause in reach, everything else behind the gear.
+struct SettingsFooter: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        HStack {
+            if let until = model.pausedUntil {
+                Button("Paused until \(until.formatted(date: .omitted, time: .shortened)) · Resume") { model.resumeNotifications() }
+            } else {
+                Button("Pause Alerts for 1 Hour") { model.pauseNotifications() }
+            }
+            Spacer()
+            Menu {
+                Picker("Menu Bar", selection: Binding(get: { model.display }, set: { model.display = $0 })) {
+                    ForEach(Display.allCases.filter { $0 == .memory || aiInstalled }, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.inline)
+                Divider()
+                if model.showsMemory {
+                    Toggle("Memory Alerts", isOn: Binding(get: { model.notifyMemory }, set: { model.notifyMemory = $0 }))
+                }
+                if model.showsAI && aiInstalled {
+                    Toggle("Session Alerts", isOn: Binding(get: { model.notifySessions }, set: { model.notifySessions = $0 }))
+                    Toggle("Run Idle Sessions at Low Priority", isOn: Binding(get: { model.autoPriority }, set: { model.autoPriority = $0 }))
+                }
+                Toggle("Alert Sound", isOn: Binding(get: { model.alertSound }, set: { model.alertSound = $0 }))
+                Toggle("Launch at Login", isOn: Binding(get: { model.launchAtLogin }, set: { model.launchAtLogin = $0 }))
+                Divider()
+                Button("Open Activity Monitor") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
+                }
+                Button("Quit Mac Breather") { NSApp.terminate(nil) }
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Settings")
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .font(.callout)
     }
 }
 
@@ -382,7 +452,7 @@ struct SessionsPanel: View {
 
             BoundedScroll(cap: screenHeight() - 260) {
                 VStack(alignment: .leading, spacing: 12) {
-                    ForEach([SessionState.waiting, .working, .done, .idle], id: \.self) { s in
+                    ForEach([SessionState.waiting, .working, .done, .seen, .idle], id: \.self) { s in
                         let rs = model.rows.filter { $0.reading.state == s }
                         if !rs.isEmpty {
                             VStack(alignment: .leading, spacing: 2) {
@@ -408,19 +478,8 @@ struct SessionsPanel: View {
             Divider()
             Text("Idle: done for more than 30 min, with nothing running. The session still holds its memory; you can close it, the thread stays in the app.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("Notify me when a session finishes or needs me",
-                   isOn: Binding(get: { model.notifySessions }, set: { model.notifySessions = $0 }))
-                .toggleStyle(.switch).controlSize(.mini).font(.callout)
-            if model.notificationsDenied {
-                HStack(spacing: 6) {
-                    Text("Notifications are off for Mac Breather.").foregroundStyle(.orange)
-                    Button("Open Settings") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
-                    }
-                    .buttonStyle(.link)
-                }
-                .font(.caption)
-            }
+            Divider()
+            SettingsFooter(model: model)
         }
         .padding(16)
         .frame(width: 380)

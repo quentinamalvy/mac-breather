@@ -35,7 +35,7 @@ struct MemStats {
     enum Health { case ok, strained, overloaded }
     var health: Health {
         if level >= 4 || freePct < 12 { return .overloaded }
-        if level >= 2 || freePct < 25 || swapUsed > 6 << 30 { return .strained }
+        if level >= 2 || freePct < 25 || swapUsed > min(total / 4 * 3, 6 << 30) { return .strained }   // heavy swap hurts at any RAM size
         return .ok
     }
 }
@@ -128,14 +128,26 @@ func procCwd(_ pid: pid_t) -> String {
     return tupleString(vp.pvi_cdir.vip_path)
 }
 
+/// Where an app is installed, wherever that is (falls back to /Applications).
+func appPath(_ bundleIds: [String], fallback: String) -> String {
+    for id in bundleIds {
+        if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) { return u.path }
+    }
+    return fallback
+}
+
+let claudeApp = appPath(["com.anthropic.claudefordesktop"], fallback: "/Applications/Claude.app")
+let codexApp = appPath(["com.openai.codex"], fallback: "/Applications/ChatGPT.app")
+let aiInstalled = FileManager.default.fileExists(atPath: claudeApp) || FileManager.default.fileExists(atPath: codexApp)
+
 /// Maps an executable path to a readable app.
 func groupFor(_ path: String) -> (key: String, name: String, appPath: String?)? {
     if path.contains("CoreSimulator") { return ("sim", "Simulator", nil) }
     if path.contains("Codex Framework.framework") || path.contains("CodexCLI.app") || path.hasSuffix("/codex") {
-        return ("codex", "Codex", "/Applications/ChatGPT.app")
+        return ("codex", "Codex", codexApp)
     }
     if path.contains("/claude-code/") || path.hasSuffix("/claude") {
-        return ("Claude", "Claude", "/Applications/Claude.app")
+        return ("Claude", "Claude", claudeApp)
     }
     if let r = path.range(of: ".app/") {
         let appPath = String(path[..<r.lowerBound]) + ".app"

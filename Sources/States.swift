@@ -5,7 +5,7 @@
 import Foundation
 
 enum SessionState: Int, Comparable {
-    case waiting = 0, working, done, idle   // display order: what needs you comes first
+    case waiting = 0, working, done, seen, idle   // display order: what needs you comes first
 
     static func < (a: SessionState, b: SessionState) -> Bool { a.rawValue < b.rawValue }
 
@@ -14,6 +14,7 @@ enum SessionState: Int, Comparable {
         case .waiting: return "Needs you"
         case .working: return "Working"
         case .done: return "Your turn"
+        case .seen: return "Seen"
         case .idle: return "Idle"
         }
     }
@@ -158,10 +159,14 @@ final class CodexReader {
                   let o = try? JSONSerialization.jsonObject(with: Data(l)) as? [String: Any],
                   o["type"] as? String == "event_msg",
                   let type = (o["payload"] as? [String: Any])?["type"] as? String else { continue }
+            let at = (o["timestamp"] as? String).flatMap { iso.date(from: $0) }
             if ["task_started", "task_complete", "turn_aborted"].contains(type)
                 || type.contains("approval") || type.contains("request_user_input") || type.contains("elicitation") {
                 t.event = type
-                t.at = (o["timestamp"] as? String).flatMap { iso.date(from: $0) }
+                t.at = at
+            } else if let e = t.event, !["task_started", "task_complete", "turn_aborted"].contains(e) {
+                t.event = "task_started"     // something happened after the approval: it is working again
+                t.at = at
             }
         }
         t.offset = start + UInt64(end - data.startIndex) + 1
