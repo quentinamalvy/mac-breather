@@ -1,4 +1,4 @@
-# Mac Breather
+# Mac Breather - AI sessions follower
 
 **Give your Mac a breather.** A tiny menu bar app that shows, at a glance, how much memory your Mac has left and what your AI coding sessions (Claude Code, Codex) are doing.
 
